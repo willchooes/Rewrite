@@ -1,71 +1,100 @@
 /**
- * zimuquan VIP 解锁 — Egern 版  (v2, 选择器已按真实 DOM 校正)
+ * zimuquan VIP 解锁 — Egern 版  (v4, 降温优化)
  * ------------------------------------------------------------------
  * 类型: http_response
  * 匹配: ^https?://(?:www\.)?zimuquan\.top/index\.php/vod/(?:play|detail)/
  *
- * 站点真实结构 (Vant UI, 非 Element UI):
+ * 站点真实结构 (Vant UI):
  *   <div class="play_video">
- *     <i class="back" onClick="history.back(-1)"></i>
+ *     <i class="back"></i>
  *     <div class="show_poster" style="background-image:url(.../vod.jpg)">
  *       <div class="show_poster_title">此影片为VIP专享…</div>
- *       <a href="/index.php/user/login.html" class="show_poster_btn van-button …">
+ *       <a href="/index.php/user/login.html" class="show_poster_btn van-button">
  *         <span class="van-button__text">登录</span>
  *       </a>
  *     </div>
  *   </div>
  *
- * 流程:
- *   1. 响应可能带 content-encoding: gzip, Egern 交给脚本的是原始字节,
- *      故按 gzip 魔数(1f 8b)判断并解压, 再还原 atob+decodeURIComponent 混淆。
- *   2. 在明文 HTML 中注入客户端脚本: 把 .show_poster_btn 改写为
- *      「▶ 直接播放（免 VIP）」并劫持其跳转, 点击后就地挂载播放器。
- *   3. 播放地址取自未授权采集接口
- *      /api.php/provide/vod/?ac=detail&ids=<vod_id> 的 vod_play_url;
- *      失败则回退到封面图同目录: .../vod.jpg -> .../index.m3u8。
- *   4. 输出时按原编码压回, 不改动 content-encoding 头。
+ * v4 相比 v3 的降温改动 (按功耗占比排序):
+ *   1. 掐掉并行解码: Vant 遮罩只是覆盖层, 站点模板自带的播放器往往已在遮罩
+ *      底下建好 video 并拉流; 我们再加一个播放器就是两路解码同时跑,
+ *      iOS 上这是最直接的发热源。挂载前 pause + 清 src + load() 停掉它们。
+ *   2. 硬解路径绝对优先: v3 的 ensureHls 把 window.Hls 检查排在原生探测之前,
+ *      模板自带 hls.js 且浏览器 MSE 可用时会走 MSE + JS 软解 —— 逐帧 demux
+ *      + 软解, 持续高温。v4 先探 canPlayType('application/vnd.apple.mpegurl'),
+ *      原生可用则完全不下载/不解析 300KB 的 hls.js, 直接交 VideoToolbox 硬解。
+ *   3. 软解兜底路径按播放器尺寸封顶码率 (capLevelToPlayerSize) 并回收后向缓冲
+ *      (backBufferLength), 前向缓冲 20/40 → 12/24, 长播不再持续涨内存。
+ *   4. 重挂载前真正释放旧播放器: pause + 清 src + load() + hls.destroy(),
+ *      否则旧 video 的解码器与网络缓冲不会立刻归还。
+ *   5. MutationObserver 观察根从 documentElement 收窄到 #app, head 里的
+ *      样式/脚本插入不再唤醒回调。
+ *   6. 点击委托在播放器挂载成功后注销, 播放期间拖进度条不再触发向上遍历。
+ *   7. getComputedStyle 仅在 inline 样式为空时调用一次并缓存, 避免强制同步布局。
+ *   8. 服务端: 定位 atob( 后用 indexOf 手工取载荷, 消除超长混淆体上的正则
+ *      回溯, 也没有窗口长度上限; 注入脚本常量在模块顶层预拼, 不再每次响应拼接;
+ *      超大 body 直接透传。UTF-8 解码改为分块批量转换, 减少大 body 的 CPU 尖峰。
  */
 
 /* ---------- 纯手写 UTF-8 编解码, 不依赖 TextDecoder ---------- */
 function utf8Decode(bytes) {
+  const n = bytes.length;
+  const CH = 8192;
+  const buf = new Array(CH);
+  let p = 0;
   let out = '';
   let i = 0;
-  while (i < bytes.length) {
+  while (i < n) {
+    /* 分块批量转换: 比逐字符字符串拼接快一个量级, 大 body 时 CPU 尖峰更小 */
+    if (p >= CH - 2) {
+      out += String.fromCharCode.apply(null, buf.slice(0, p));
+      p = 0;
+    }
     const c = bytes[i++];
     if (c < 0x80) {
-      out += String.fromCharCode(c);
+      buf[p++] = c;
     } else if (c < 0xC0) {
       /* 非法续字节, 丢弃 */
     } else if (c < 0xE0) {
-      out += String.fromCharCode(((c & 0x1F) << 6) | (bytes[i++] & 0x3F));
+      buf[p++] = ((c & 0x1F) << 6) | (bytes[i++] & 0x3F);
     } else if (c < 0xF0) {
-      out += String.fromCharCode(((c & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
+      buf[p++] = ((c & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
     } else {
       let cp = ((c & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
       cp -= 0x10000;
-      out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+      buf[p++] = 0xD800 + (cp >> 10);
+      buf[p++] = 0xDC00 + (cp & 0x3FF);
     }
   }
+  if (p > 0) out += String.fromCharCode.apply(null, buf.slice(0, p));
   return out;
 }
 
 function utf8Encode(str) {
-  const out = [];
-  for (let i = 0; i < str.length; i++) {
+  const n = str.length;
+  const out = new Uint8Array(n * 3);
+  let p = 0;
+  for (let i = 0; i < n; i++) {
     const c = str.charCodeAt(i);
     if (c < 0x80) {
-      out.push(c);
+      out[p++] = c;
     } else if (c < 0x800) {
-      out.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+      out[p++] = 0xC0 | (c >> 6);
+      out[p++] = 0x80 | (c & 0x3F);
     } else if (c >= 0xD800 && c <= 0xDBFF) {
       const c2 = str.charCodeAt(++i);
       const cp = 0x10000 + ((c & 0x3FF) << 10) + (c2 & 0x3FF);
-      out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+      out[p++] = 0xF0 | (cp >> 18);
+      out[p++] = 0x80 | ((cp >> 12) & 0x3F);
+      out[p++] = 0x80 | ((cp >> 6) & 0x3F);
+      out[p++] = 0x80 | (cp & 0x3F);
     } else {
-      out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+      out[p++] = 0xE0 | (c >> 12);
+      out[p++] = 0x80 | ((c >> 6) & 0x3F);
+      out[p++] = 0x80 | (c & 0x3F);
     }
   }
-  return new Uint8Array(out);
+  return out.subarray(0, p);
 }
 
 const B64CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -73,21 +102,42 @@ const B64CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 /* base64 -> latin1 字符串(每字符即一字节) */
 function b64decode(input) {
   const str = String(input).replace(/[^A-Za-z0-9+/=]/g, '');
-  const bytes = [];
+  const n = str.length;
+  const bytes = new Uint8Array((n >> 2) * 3);
+  let p = 0;
   let i = 0;
-  while (i < str.length) {
+  while (i < n) {
     const e1 = B64CHARS.indexOf(str.charAt(i++));
     const e2 = B64CHARS.indexOf(str.charAt(i++));
     const e3 = B64CHARS.indexOf(str.charAt(i++));
     const e4 = B64CHARS.indexOf(str.charAt(i++));
     if (e1 < 0 || e2 < 0) break;
-    bytes.push((e1 << 2) | (e2 >> 4));
-    if (e3 >= 0 && str.charAt(i - 2) !== '=') bytes.push(((e2 & 15) << 4) | (e3 >> 2));
-    if (e4 >= 0 && str.charAt(i - 1) !== '=') bytes.push(((e3 & 3) << 6) | e4);
+    bytes[p++] = (e1 << 2) | (e2 >> 4);
+    if (e3 >= 0 && str.charAt(i - 2) !== '=') bytes[p++] = ((e2 & 15) << 4) | (e3 >> 2);
+    if (e4 >= 0 && str.charAt(i - 1) !== '=') bytes[p++] = ((e3 & 3) << 6) | e4;
   }
-  let s = '';
-  for (let k = 0; k < bytes.length; k++) s += String.fromCharCode(bytes[k]);
-  return s;
+  return utf8Decode(bytes.subarray(0, p));
+}
+
+/* 手工提取 atob("...") 的载荷。
+   不用正则: [A-Za-z0-9+/=\s]{40,} 在畸形页面上的回溯虽然是一次性的线性扫描,
+   但配合窗口截断会漏掉长载荷(真实播放页混淆体可达 30-80KB)。这里用
+   indexOf 定位引号 + 单次字符类校验, 既没有长度上限也没有回溯风险。 */
+function extractB64(s, from) {
+  const n = s.length;
+  let i = from;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || c === 9 || c === 10 || c === 13) { i++; continue; }
+    break;
+  }
+  const quote = s.charAt(i);
+  if (quote !== '"' && quote !== "'") return '';
+  const end = s.indexOf(quote, i + 1);
+  if (end < 0) return '';
+  const payload = s.slice(i + 1, end);
+  if (payload.length < 40) return '';
+  return /^[A-Za-z0-9+/=\s]+$/.test(payload) ? payload : '';
 }
 
 /* 逐层剥离 URL 编码, 出现 HTML 标记即停 */
@@ -107,44 +157,42 @@ function unescapeAll(str) {
 const CLIENT = `
 (function () {
   'use strict';
+  if (window.__zqInjected) return;
+  window.__zqInjected = true;
+
   var m = location.pathname.match(/\\/vod\\/(?:play|detail)\\/id\\/(\\d+)/);
   var VOD = m ? m[1] : '';
   if (!VOD) return;
 
+  var DEBUG = /[?&]zqdebug/.test(location.search);
   function q(s) { return document.querySelector(s); }
 
-  /* ---- 诊断条: 确认脚本是否真的执行到浏览器 ---- */
-  var diag = null;
-  function makeDiag() {
-    if (diag) return diag;
-    diag = document.createElement('div');
-    diag.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:2147483647;'
-      + 'background:#ffb300;color:#111;font:12px/1.6 -apple-system,sans-serif;'
-      + 'padding:5px 8px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.3)';
-    var x = document.createElement('span');
-    x.textContent = ' ✕';
-    x.style.cssText = 'position:absolute;right:10px;top:4px;cursor:pointer;font-weight:700';
-    x.onclick = function () { if (diag && diag.parentNode) diag.parentNode.removeChild(diag); diag = null; };
-    diag.appendChild(x);
-    if (document.body) document.body.appendChild(diag);
-    return diag;
-  }
+  /* 一次性探测原生 HLS: 结果决定之后走硬解还是软解, 不再重复创建 video 探针 */
+  var NATIVE_HLS = (function () {
+    var p = document.createElement('video');
+    return !!(p.canPlayType && p.canPlayType('application/vnd.apple.mpegurl'));
+  })();
 
+  /* 诊断条: 默认不创建, 只在 ?zqdebug 下启用, 避免任何常驻 DOM 开销 */
+  var diag = null;
   function report(extra) {
-    var d = makeDiag();
-    if (!d) return;
+    if (!DEBUG) return;
+    if (!diag) {
+      diag = document.createElement('div');
+      diag.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:2147483647;'
+        + 'background:#ffb300;color:#111;font:12px/1.6 -apple-system,sans-serif;'
+        + 'padding:5px 8px;text-align:center';
+      if (document.body) document.body.appendChild(diag);
+    }
     var poster = q('.show_poster');
     var btn = q('.show_poster_btn');
-    var txt = 'zimuquan v2 | vod=' + VOD
+    diag.textContent = 'zimuquan v4 | vod=' + VOD
       + ' | 遮罩=' + (poster ? '有' : '无')
-      + ' | 按钮=' + (btn ? '有' : '无');
-    if (extra) txt += ' | ' + extra;
-    var back = d.lastChild;
-    d.textContent = txt;
-    if (back && back.parentNode === d) d.appendChild(back);
+      + ' | 按钮=' + (btn ? '有' : '无')
+      + ' | 解码=' + (NATIVE_HLS ? '原生硬解' : 'hls.js')
+      + (extra ? ' | ' + extra : '');
   }
 
-  /* ---- 取源 ---- */
   /* 苹果CMS vod_play_url 形态: 线路A$$$线路B / 集1#集2 / 标题$地址 */
   function pickUrl(raw) {
     if (!raw) return '';
@@ -158,14 +206,21 @@ const CLIENT = `
     return '';
   }
 
+  /* 兜底: 封面图与索引文件同目录, .../vod.jpg -> .../index.m3u8 */
+  var coverCache = '';
   function fromCover() {
+    if (coverCache) return coverCache;
     var p = q('.show_poster');
     if (!p) return '';
-    var bg = p.style.backgroundImage || getComputedStyle(p).backgroundImage || '';
+    /* inline 样式优先; 只有为空时才碰 getComputedStyle, 它会强制同步布局 */
+    var bg = p.style.backgroundImage;
+    if (!bg) {
+      try { bg = getComputedStyle(p).backgroundImage || ''; } catch (e) { bg = ''; }
+    }
     var mm = bg.match(/url\\(["']?([^"')]+)["']?\\)/);
     if (!mm) return '';
-    /* 封面图与索引文件同目录: .../vod.jpg -> .../index.m3u8 */
-    return mm[1].replace(/vod\\.jpg.*$/i, 'index.m3u8');
+    coverCache = mm[1].replace(/vod\\.jpg.*$/i, 'index.m3u8');
+    return coverCache;
   }
 
   function fromApi(cb) {
@@ -184,19 +239,64 @@ const CLIENT = `
     xhr.send();
   }
 
-  /* ---- 播放器 ---- */
+  /* ---- 解码路径选择 ----
+     原生 HLS 可用就绝不加载 hls.js: 省掉 300KB JS 的下载与解析, 且交给
+     VideoToolbox 硬解。只有浏览器明确不支持原生 HLS 时才回落软解。 */
+  var hlsState = 0; /* 0=未加载 1=加载中 2=可用 3=不可用 */
   function ensureHls(cb) {
-    if (window.Hls) { cb(); return; }
-    var probe = document.createElement('video');
-    if (probe.canPlayType('application/vnd.apple.mpegurl')) { cb(); return; }
+    if (NATIVE_HLS) { cb(false); return; }
+    if (window.Hls && window.Hls.isSupported && window.Hls.isSupported()) { cb(true); return; }
+    if (hlsState !== 0) { cb(hlsState === 2); return; }
+    hlsState = 1;
     var s = document.createElement('script');
     s.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js';
-    s.onload = cb;
-    s.onerror = cb;
+    s.onload = function () {
+      hlsState = (window.Hls && window.Hls.isSupported && window.Hls.isSupported()) ? 2 : 3;
+      cb(hlsState === 2);
+    };
+    s.onerror = function () { hlsState = 3; cb(false); };
     document.head.appendChild(s);
   }
 
-  function mountPlayer(url) {
+  var hlsInst = null;
+
+  /* 真正释放解码器与网络缓冲: 仅从 DOM 摘除 video 不会立刻归还资源 */
+  function teardown() {
+    if (hlsInst) {
+      try { hlsInst.destroy(); } catch (e) {}
+      hlsInst = null;
+    }
+    var v = document.getElementById('zq-video');
+    if (v) {
+      try { v.pause(); } catch (e) {}
+      v.removeAttribute('src');
+      try { v.load(); } catch (e) {}
+    }
+  }
+
+  /* iOS 上多路解码并行是发热主因: Vant 遮罩只是一层覆盖, 站点模板自带的
+     播放器通常已经在遮罩底下建好 video 并拉流。挂载前把它们逐个掐掉,
+     只保留我们这一个解码器。元素本身不动, 避免模板 JS 拿到 null 报错。
+
+     无条件释放而非判断 src 是否存在: 站点可能用 video.src 属性赋值,
+     也可能由 hls.js 挂在 srcObject(ManagedMediaSource) 上, 两种都要断。 */
+  function quiesce() {
+    var vs = document.querySelectorAll('video');
+    for (var i = 0; i < vs.length; i++) {
+      if (vs[i].id === 'zq-video') continue;
+      try { vs[i].pause(); } catch (e) {}
+      try {
+        vs[i].removeAttribute('src');
+        vs[i].srcObject = null;
+        vs[i].load();
+      } catch (e) {}
+    }
+  }
+
+  function mountPlayer(url, useHls) {
+    teardown();
+    quiesce();
+
     /* 只摘掉 VIP 海报层, 保留 .back 返回按钮 */
     var posters = document.querySelectorAll('.show_poster');
     for (var i = 0; i < posters.length; i++) {
@@ -209,38 +309,51 @@ const CLIENT = `
 
     var box = document.createElement('div');
     box.id = 'zq-player-box';
-    box.style.cssText = 'background:#000;border-radius:8px;overflow:hidden;margin:0 auto';
-
+    box.style.cssText = 'background:#000;border-radius:8px;overflow:hidden;margin:0 auto;'
+      + 'contain:content';
     var v = document.createElement('video');
     v.id = 'zq-video';
     v.controls = true;
-    v.autoplay = true;
     v.setAttribute('playsinline', '');
     v.setAttribute('webkit-playsinline', '');
+    v.setAttribute('preload', 'metadata');
     v.style.cssText = 'width:100%;max-height:76vh;display:block;background:#000';
     box.appendChild(v);
     host.appendChild(box);
 
     var tip = document.createElement('div');
     tip.style.cssText = 'font-size:12px;color:#888;margin:10px 12px;word-break:break-all;line-height:1.6';
-    tip.textContent = '直连源: ' + url;
+    tip.textContent = '直连源: ' + url
+      + (NATIVE_HLS ? ' — iOS 上全屏播放走系统播放器, 比内联更省电' : '');
     host.appendChild(tip);
 
-    if (window.Hls && window.Hls.isSupported()) {
-      var h = new window.Hls({ maxBufferLength: 30 });
-      h.on(window.Hls.Events.ERROR, function (_e, data) {
+    if (useHls && window.Hls) {
+      /* 移动端省电配置: 按播放器实际尺寸封顶码率(4K 源缩到手机屏上解码量骤降),
+         前向缓冲收紧, 后向缓冲回收(默认 Infinity 会让内存与 GC 压力持续增长) */
+      hlsInst = new window.Hls({
+        capLevelToPlayerSize: true,
+        maxBufferLength: 12,
+        maxMaxBufferLength: 24,
+        backBufferLength: 30,
+        enableWorker: true
+      });
+      hlsInst.on(window.Hls.Events.ERROR, function (_e, data) {
         if (data && data.fatal) {
           tip.style.color = '#e74c3c';
           tip.textContent = '拉流失败(' + data.details + ') — 该 CDN 线路可能已失效: ' + url;
         }
       });
-      h.loadSource(url);
-      h.attachMedia(v);
+      hlsInst.loadSource(url);
+      hlsInst.attachMedia(v);
     } else {
+      /* 原生路径: 交给系统硬解, 最省电 */
       v.src = url;
     }
     var pr = v.play();
     if (pr && pr.catch) pr.catch(function () {});
+
+    /* 播放器已就位, 撤掉全局捕获监听: 之后拖进度条/点控制条不再触发遍历 */
+    document.removeEventListener('click', onDocClick, true);
   }
 
   var busy = false;
@@ -262,11 +375,11 @@ const CLIENT = `
         return;
       }
       report('已取源, 挂载播放器');
-      ensureHls(function () { mountPlayer(u); });
+      ensureHls(function (useHls) { mountPlayer(u, useHls); });
     });
   }
 
-  /* ---- 事件委托: 拦掉 .show_poster_btn 原本跳登录页的行为 ---- */
+  /* 事件委托: 拦掉 .show_poster_btn 原本跳登录页的行为 */
   function isPosterBtn(el) {
     while (el && el !== document) {
       if (el.classList && (el.classList.contains('show_poster_btn') || el.classList.contains('zq-play-btn'))) return el;
@@ -275,14 +388,14 @@ const CLIENT = `
     return null;
   }
 
-  document.addEventListener('click', function (ev) {
+  function onDocClick(ev) {
     var btn = isPosterBtn(ev.target);
     if (!btn) return;
     ev.preventDefault();
     ev.stopPropagation();
     start(btn);
-    return false;
-  }, true);
+  }
+  document.addEventListener('click', onDocClick, true);
 
   /* ---- 改写按钮 / 兜底注入 ---- */
   var fallback = null;
@@ -301,7 +414,7 @@ const CLIENT = `
   }
 
   function bind() {
-    var poster = q('.show_poster');
+    /* 少一次查询: 按钮命中即返回, 海报层只在按钮缺席时才查 */
     var btn = q('.show_poster_btn');
     if (btn) {
       var t = btn.querySelector('.van-button__text') || btn;
@@ -310,8 +423,7 @@ const CLIENT = `
       report();
       return true;
     }
-    if (poster) {
-      /* 有遮罩但没按钮: 补一个 */
+    if (q('.show_poster')) {
       makeFallback();
       report();
       return true;
@@ -319,21 +431,43 @@ const CLIENT = `
     return false;
   }
 
-  var tries = 0;
-  function boot() {
-    if (bind()) return;
-    if (++tries > 40) {
-      /* 10 秒仍未出现 VIP 层: 直接给兜底按钮, 保证一定有入口 */
-      makeFallback();
-      report('兜底按钮');
-      return;
+  /* 事件驱动: 只在 DOM 真的变化时检查一次, 不再做定时轮询空转 */
+  if (bind()) return;
+
+  var done = false;
+  var mo = new MutationObserver(function () {
+    if (done) return;
+    if (bind()) {
+      done = true;
+      stopWatch();
     }
-    setTimeout(boot, 250);
+  });
+
+  function stopWatch() {
+    try { mo.disconnect(); } catch (e) {}
+    clearTimeout(timer);
   }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
-  else boot();
+
+  /* 观察根收窄到 Vant 挂载点: 不再因 head 里的样式/脚本插入而唤醒回调 */
+  var root = document.getElementById('app') || document.body || document.documentElement;
+  if (root) mo.observe(root, { childList: true, subtree: true });
+
+  /* 一次性兜底: 2.5 秒后仍未出现 VIP 层就给出按钮并彻底停止观察 */
+  var timer = setTimeout(function () {
+    if (done) return;
+    done = true;
+    stopWatch();
+    makeFallback();
+    report('兜底按钮');
+  }, 2500);
 })();
 `;
+
+/* 模块顶层预拼一次, 避免每次响应都拼接 11KB 字符串 */
+const INJECTED = '<script>' + CLIENT + '<' + '/script>';
+
+/* 播放页混淆体约 30KB; 超出阈值说明不是目标页面形态, 直接透传省掉全量解码 */
+const MAX_BODY = 2 * 1024 * 1024;
 
 export default async function (ctx) {
   let bytes;
@@ -342,7 +476,9 @@ export default async function (ctx) {
   } catch (e) {
     return;
   }
-  if (!bytes.length) return;
+
+  /* 长度预检: 详情页跳转壳约 264B, 播放页混淆体 >30KB */
+  if (bytes.length < 400 || bytes.length > MAX_BODY) return;
 
   /* 按 gzip 魔数判断: 1f 8b */
   const isGzip = bytes[0] === 0x1f && bytes[1] === 0x8b;
@@ -356,22 +492,26 @@ export default async function (ctx) {
     raw = utf8Decode(bytes);
   }
 
-  let html = raw;
-  const m = raw.match(/atob\(\s*["']([A-Za-z0-9+/=\s]{40,})["']\s*\)/);
+  /* 内容预检: 只有 atob + document.write 的混淆页才需要改写, 其余原样放行 */
+  const at = raw.indexOf('atob(');
+  if (at < 0 || raw.indexOf('document.write') < 0) return;
 
-  if (m) {
-    const dec = unescapeAll(b64decode(m[1]));
+  let html = raw;
+
+  const payload = extractB64(raw, at + 5);
+  if (payload) {
+    const dec = unescapeAll(b64decode(payload));
     if (dec.includes('<') && /<\/body>|<\/html>|<div/i.test(dec)) html = dec;
   }
 
-  const injected = '<script>' + CLIENT + '<' + '/script>';
+  if (html.indexOf('show_poster') < 0 && html.indexOf('play_video') < 0) return;
 
   /* 必须用函数式替换: 字符串形式下 $$ / $' / $& 会被 String.replace 特殊解释,
      注入代码里的 split('$$$') 会被破坏。 */
   if (/<\/body>/i.test(html)) {
-    html = html.replace(/<\/body>/i, () => injected + '</body>');
+    html = html.replace(/<\/body>/i, () => INJECTED + '</body>');
   } else {
-    html = html + injected;
+    html = html + INJECTED;
   }
 
   /* 原编码压回, 不动 content-encoding 头, 避免客户端解压失败 */
