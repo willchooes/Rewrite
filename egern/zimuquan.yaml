@@ -1,0 +1,21 @@
+name: "字母圈 zimuquan VIP 解锁"
+description: "解除 zimuquan.top 播放页的 VIP 遮罩，点击遮罩上的按钮直接取源播放"
+author: "Little Code Sauce"
+homepage: "https://github.com/willchooes/Rewrite"
+icon: "play.rectangle.fill"
+
+# script_url 指向本仓库 raw，多设备共享 / 自动更新。
+scriptings:
+  - http_response:
+      name: "zimuquan VIP 解锁"
+      match: "^https?://(?:www\\.)?zimuquan\\.top/index\\.php/vod/(?:play|detail)/"
+      script_url: "https://raw.githubusercontent.com/willchooes/Rewrite/refs/heads/main/egern/zimuquan.js"
+      body_required: true
+      max_size: 8388608
+      timeout: 30
+      update_interval: 86400
+
+mitm:
+  hostnames:
+    - "zimuquan.top"
+    - "www.zimuquan.top"
