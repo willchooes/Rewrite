@@ -5,23 +5,61 @@
  * 匹配: ^https?://(?:www\.)?zimuquan\.top/index\.php/vod/(?:play|detail)/
  *
  * 流程:
- *   1. 播放页响应体是 <script>atob("...")</script> + document.write 双层混淆,
- *      浏览器里才还原成 HTML。此处服务端先解码, 还原明文 HTML。
+ *   1. 站点响应可能带 content-encoding: gzip, 且 Egern 的 ctx.compress 需要手动调用,
+ *      因此先按 gzip 魔数(1f 8b)判断并解压, 再还原 atob+decodeURIComponent 混淆。
  *   2. 在明文 HTML 末尾注入客户端脚本, 把 VIP 遮罩(.popup)上的原「登录」按钮
- *      改写为「▶ 直接播放（免 VIP）」, 点击即移除遮罩并挂载播放器。
- *   3. 播放地址取自站点自身的未授权采集接口
- *      /api.php/provide/vod/?ac=detail&ids=<vod_id> 的 vod_play_url 字段;
+ *      改写为「▶ 直接播放（免 VIP）」。页面顶部会有一条黄色诊断条。
+ *   3. 播放地址取自站点未授权采集接口
+ *      /api.php/provide/vod/?ac=detail&ids=<vod_id> 的 vod_play_url;
  *      失败则回退到遮罩背景图 URL(vod.jpg -> index.m3u8, 两者同目录)。
- *   4. AES-128 的 HLS 由 hls.js 或 Safari 原生 HLS 自动拉取同目录 key.key 解密。
- *
- * 已知限制:
- *   zhuanma14.aeondigit.com 整条 CDN 线路回源 502(已枯死), 命中该线路的视频
- *   无法播放, 页面会给出明确失败提示。
+ *   4. 输出时按原编码压回, 不改动 content-encoding 头, 避免客户端解压失败。
  */
+
+/* ---------- 纯手写 UTF-8 编解码, 不依赖 TextDecoder ---------- */
+function utf8Decode(bytes) {
+  let out = '';
+  let i = 0;
+  while (i < bytes.length) {
+    const c = bytes[i++];
+    if (c < 0x80) {
+      out += String.fromCharCode(c);
+    } else if (c < 0xC0) {
+      /* 非法续字节, 丢弃 */
+    } else if (c < 0xE0) {
+      out += String.fromCharCode(((c & 0x1F) << 6) | (bytes[i++] & 0x3F));
+    } else if (c < 0xF0) {
+      out += String.fromCharCode(((c & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
+    } else {
+      let cp = ((c & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
+      cp -= 0x10000;
+      out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+    }
+  }
+  return out;
+}
+
+function utf8Encode(str) {
+  const out = [];
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 0x80) {
+      out.push(c);
+    } else if (c < 0x800) {
+      out.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+    } else if (c >= 0xD800 && c <= 0xDBFF) {
+      const c2 = str.charCodeAt(++i);
+      const cp = 0x10000 + ((c & 0x3FF) << 10) + (c2 & 0x3FF);
+      out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+    } else {
+      out.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+    }
+  }
+  return new Uint8Array(out);
+}
 
 const B64CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
-/* base64 -> latin1 字符串(每字符即一字节), 不依赖 atob / TextDecoder */
+/* base64 -> latin1 字符串(每字符即一字节) */
 function b64decode(input) {
   const str = String(input).replace(/[^A-Za-z0-9+/=]/g, '');
   const bytes = [];
@@ -63,6 +101,29 @@ const CLIENT = `
   if (!VOD) return;
 
   function q(s) { return document.querySelector(s); }
+
+  /* 诊断条: 用于确认脚本是否真的执行到浏览器 */
+  var diag = null;
+  function makeDiag() {
+    if (diag) return diag;
+    diag = document.createElement('div');
+    diag.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:2147483647;'
+      + 'background:#ffb300;color:#111;font:12px/1.6 -apple-system,sans-serif;'
+      + 'padding:5px 8px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.3)';
+    if (document.body) document.body.appendChild(diag);
+    return diag;
+  }
+
+  function report(extra) {
+    var d = makeDiag();
+    if (!d) return;
+    var mask = q('.popup');
+    var btn = mask ? (mask.querySelector('.el-login-btn') || mask.querySelector('button')) : null;
+    d.textContent = 'zimuquan 已注入 | vod=' + VOD
+      + ' | 遮罩=' + (mask ? '有' : '无')
+      + ' | 按钮=' + (btn ? '有' : '无')
+      + (extra ? ' | ' + extra : '');
+  }
 
   function killMask() {
     var list = document.querySelectorAll('.popup');
@@ -117,6 +178,7 @@ const CLIENT = `
   }
 
   function mountPlayer(url) {
+    killMask();
     var host = q('.container') || q('.detail .box') || q('.detail') || document.body;
     host.innerHTML = '';
     var box = document.createElement('div');
@@ -151,12 +213,14 @@ const CLIENT = `
 
   function start(btn) {
     if (btn) { btn.disabled = true; btn.style.opacity = '.6'; btn.textContent = '解析中…'; }
+    report('解析中');
     fromApi(function (u) {
       if (!u) {
         if (btn) { btn.disabled = false; btn.style.opacity = '1'; btn.textContent = '未取到播放地址'; }
+        report('未取到地址');
         return;
       }
-      killMask();
+      report('已取源, 挂载播放器');
       ensureHls(function () { mountPlayer(u); });
     });
   }
@@ -176,6 +240,7 @@ const CLIENT = `
   }, true);
 
   function bind() {
+    report();
     var mask = q('.popup');
     if (!mask) return false;
     var btn = mask.querySelector('.el-login-btn') || mask.querySelector('button');
@@ -194,7 +259,6 @@ const CLIENT = `
     return true;
   }
 
-  /* 播放页 DOM 由 document.write 构建, 可能晚于 DOMContentLoaded, 故重试 */
   var tries = 0;
   function boot() {
     if (bind()) return;
@@ -207,13 +271,25 @@ const CLIENT = `
 `;
 
 export default async function (ctx) {
-  let raw = '';
+  let bytes;
   try {
-    raw = await ctx.response.text();
+    bytes = new Uint8Array(await ctx.response.arrayBuffer());
   } catch (e) {
     return;
   }
-  if (!raw) return;
+  if (!bytes.length) return;
+
+  /* 按 gzip 魔数判断: 1f 8b */
+  const isGzip = bytes[0] === 0x1f && bytes[1] === 0x8b;
+  let raw;
+  if (isGzip) {
+    let un = null;
+    try { un = await ctx.compress.gunzip(bytes); } catch (e) { un = null; }
+    if (!un) return; /* 解压失败则原样透传, 不做破坏性改写 */
+    raw = utf8Decode(un);
+  } else {
+    raw = utf8Decode(bytes);
+  }
 
   let html = raw;
   const m = raw.match(/atob\(\s*["']([A-Za-z0-9+/=\s]{40,})["']\s*\)/);
@@ -225,20 +301,21 @@ export default async function (ctx) {
 
   const injected = '<script>' + CLIENT + '<' + '/script>';
 
-  /* 必须用函数式替换: 若直接传字符串, 其内部的 $$ / $' / $& 会被
-     String.replace 当作特殊模式解释, 注入代码里的 split('$$$') 会被破坏。 */
+  /* 必须用函数式替换: 字符串形式下 $$ / $' / $& 会被 String.replace 特殊解释,
+     注入代码里的 split('$$$') 会被破坏。 */
   if (/<\/body>/i.test(html)) {
     html = html.replace(/<\/body>/i, () => injected + '</body>');
   } else {
     html = html + injected;
   }
 
-  const headers = ctx.response.headers;
-  if (headers && typeof headers.delete === 'function') {
-    /* 内容已变为未压缩明文, 清掉会误导客户端的编码/长度头 */
-    headers.delete('content-encoding');
-    headers.delete('content-length');
-    return { headers, body: html };
+  /* 原编码压回, 不动 content-encoding 头, 避免客户端解压失败 */
+  if (isGzip) {
+    try {
+      const gz = await ctx.compress.gzip(utf8Encode(html));
+      if (gz) return { body: gz };
+    } catch (e) {}
+    return { body: html };
   }
   return { body: html };
 }
