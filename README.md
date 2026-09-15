@@ -17,8 +17,9 @@
 │   ├── zimuquan.local.yaml   # Egern 模块（本地脚本版，引用同目录 zimuquan.js）
 │   └── zimuquan.js           # Egern http_response 脚本
 └── surge/
-    ├── zimuquan.sgmodule     # Surge 模块
-    └── zimuquan.js           # Surge http_response 脚本
+    ├── zimuquan.sgmodule        # Surge 模块（远程脚本版）
+    ├── zimuquan.local.sgmodule  # Surge 模块（本地脚本版）
+    └── zimuquan.js              # Surge http_response 脚本
 ```
 
 ### Egern 使用
@@ -44,13 +45,13 @@ modules:
 
 ### Surge 使用
 
-模块地址：
+远程版（推荐，加一条模块链接即可，脚本自动从本仓库加载）：
 
 ```
 https://raw.githubusercontent.com/willchooes/Rewrite/refs/heads/main/surge/zimuquan.sgmodule
 ```
 
-在 Surge 中直接添加该模块链接即可。模块内 `script-path=zimuquan.js` 为相对路径，需把 `surge/zimuquan.js` 放到 Surge 配置目录；若希望完全走远程，把 `script-path` 换成上面的 raw 地址。
+本地版：下载 `surge/zimuquan.local.sgmodule` 与 `surge/zimuquan.js` 放进 Surge 配置目录，再引用模块。此时模块内 `script-path=zimuquan.js` 走相对路径。
 
 ### 工作原理
 

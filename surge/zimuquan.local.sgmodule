@@ -1,0 +1,11 @@
+#!name=字母圈 zimuquan VIP 解锁（本地脚本版）
+#!desc=解除 zimuquan.top 播放页的 VIP 遮罩，点击遮罩上的按钮直接取源播放
+#!author=Little Code Sauce
+#!note=依赖站点自身未授权采集接口 /api.php/provide/vod/ 取 vod_play_url
+#!note=本版脚本走本地加载：把本文件与 zimuquan.js 一起放进 Surge 配置目录
+
+[Script]
+zimuquan_vip = type=http-response,pattern=^https?://(?:www\.)?zimuquan\.top/index\.php/vod/(?:play|detail)/,requires-body=1,max-size=0,script-path=zimuquan.js
+
+[MITM]
+hostname = %APPEND% zimuquan.top, www.zimuquan.top
